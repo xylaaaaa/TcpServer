@@ -121,7 +121,7 @@ class Buffer {
             MoveReadOffset(len);
         }
 
-        std::string ReadString(uint64_t len) {
+        std::string ReadAsString(uint64_t len) {
             assert(len <= ReadAbleSize());
             std::string str;
             str.resize(len);
@@ -166,7 +166,7 @@ class Socket {
     public:
         Socket():_sockfd(-1){}
         Socket(int fd): _sockfd(fd) {}
-        ~Socket() { Cloce(); }
+        ~Socket() { Close(); }
         int Fd() { return _sockfd; }
         bool Create() {
             _sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -204,7 +204,7 @@ class Socket {
             addr.sin_family = AF_INET;
             addr.sin_port = htons(port);
             addr.sin_addr.s_addr = inet_addr(ip.c_str());
-            socklen_t len = sizof(struct sockaddr_in);
+            socklen_t len = sizeof(struct sockaddr_in);
             int ret = connect(_sockfd, (struct sockaddr*)&addr, len);
             if (ret < 0) {
                 ERR_LOG("CONNECT SERVER FAILED!");
@@ -223,7 +223,7 @@ class Socket {
         }
 
         ssize_t Recv(void *buf, size_t len, int flag = 0) {
-            ssize_t ret = recv(_sockfd, buf, len, falg);
+            ssize_t ret = recv(_sockfd, buf, len, flag);
             if (ret <= 0) {
                 //EAGAIN 当前socket的接收缓冲区中没有数据了，在非阻塞的情况下才会有这个错误
                 //EINTR  表示当前socket的阻塞等待，被信号打断了，
@@ -240,7 +240,8 @@ class Socket {
             return Recv(buf, len, MSG_DONTWAIT); // MSG_DONTWAIT 表示当前接收为非阻塞。
         }
 
-        sszie_t Send(const void *buf, size_t len, int falg = 0) {
+        ssize_t Send(const void *buf, size_t len, int flag = 0) {
+            ssize_t ret = send(_sockfd, buf, len, flag);
             if (ret < 0) {
                 if (errno == EAGAIN || errno == EINTR) {
                     return 0;
@@ -251,7 +252,7 @@ class Socket {
             return ret;
         }
 
-        ssize_t NonBlockSend(void *buf, len, MSG_DONTWAIT);
+        ssize_t NonBlockSend(void *buf, size_t len, int flag = MSG_DONTWAIT);
 
         void Close() {
             if (_sockfd != -1) {
@@ -262,7 +263,7 @@ class Socket {
 
         
 
-}
+};
 
 class Poller;
 class EventLoop;
@@ -281,14 +282,14 @@ class Channel {
     
     public:
         Channel(EventLoop *loop, int fd) : _fd(fd), _events(0), _revents(0), _loop(loop) {}
-        int Fd() { return fd; }
-        uint32_t Event() { return _events; } // 获取想要监控的事件
+        int Fd() { return _fd; }
+        uint32_t Events() { return _events; } // 获取想要监控的事件
         void SetREvents(uint32_t events) { _revents = events; } // 设置实际就绪的事件
-        void SetReadCallback(const EventCallback &cb) { _read_callback = cb; }
-        void SetWriteCallback(const EventCallback &cb) { _write_callback = cb; }
-        void SetErrorCallback(const EventCallback &cb) { _error_callback = cb; }
-        void SetCloseCallback(const EventCallback &cb) { _close_callback = cb; }
-        void SetEventCallback(const EventCallback &cb) { _event_callback = cb; }
+        void SetReadCallback(const Eventcallback &cb) { _read_callback = cb; }
+        void SetWriteCallback(const Eventcallback &cb) { _write_callback = cb; }
+        void SetErrorCallback(const Eventcallback &cb) { _error_callback = cb; }
+        void SetCloseCallback(const Eventcallback &cb) { _close_callback = cb; }
+        void SetEventCallback(const Eventcallback &cb) { _event_callback = cb; }
         // 当前是否监控了可读
         bool ReadAble() { return ( _events & EPOLLIN); }
         // 可写
@@ -325,11 +326,11 @@ class Channel {
 };
 
 #define MAX_EPOLLEVENTS 1024
-calss Poller {
+class Poller {
     private:
         int _epfd;
         struct epoll_event _evs[MAX_EPOLLEVENTS];
-        std::unorfered_map<int, channel*> _channels;
+        std::unordered_map<int, Channel*> _channels;
     private:    
         void Update(Channel *channel, int op) {
             // int epoll_ctl(int epfd, int op, int fd, struct epoll_event *ev);
@@ -360,7 +361,7 @@ calss Poller {
             }
         }
 
-        void UpdateEvent(channel *channel) {
+        void UpdateEvent(Channel *channel) {
             bool ret = HasChannel(channel);
             if (ret == false) {
                 _channels.insert(std::make_pair(channel->Fd(), channel));
@@ -408,6 +409,131 @@ calss Poller {
         }
 };
 
+using TaskFunc = std::function<void()>;
+using ReleaseFunc = std::function<void()>;
+class TimerTask {
+    private:
+        uint64_t _id;
+        uint32_t _timeout;
+};
 
+class TimerWheel {};
+
+class EventLoop {
+    private:
+        using Functor = std::function<void()>;
+        std::thread::id _thread_id; // 线程ID
+        int _event_fd; // eventid唤醒IO事件监控有可能导致的阻塞，一个轻量级的事件通知机制
+        std::unique_ptr<Channel> _event_channel;
+        Poller _poller; // 对所有描述符的事件监控
+        std::vector<Functor> _tasks; // 任务池
+        std::mutex _mutex; // 实现任务池操作的线程安全
+        TimerWheel _timer_wheel; //定时器模块
+    public:
+        // 执行任务池中的所有任务
+        void RunAllTask() {
+            std::vector<Functor> functor;
+            {
+                std::unique_lock<std::mutex> _lock(_mutex);
+                _tasks.swap(functor);
+            }
+            for (auto &f : functor) {
+                f();
+            }
+            return ;
+        }
+
+        static int CreateEventFd() {
+            // _1：计时器的初始值
+            // _2：标志位参数 EFD_CLOEXEC（执行exec（）系列调用时自动关闭该fd，防止子进程继承fd，提升安全性）  
+            // EFD_NONBLOCK（非阻塞）
+            int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); 
+            if (efd < 0) {
+                ERR_LOG("CREATE EVENTFD FAILED");
+                abort();
+            }
+            return efd;
+        }
+        
+        void ReadEventfd() {
+            uint64_t res = 0;
+            int ret = read(_event_fd, &res, sizeof(res));
+            if (ret < 0) {
+                //EINTR -- 被信号打断；   EAGAIN -- 表示无数据可读
+                if (errno == EINTR || errno == EAGAIN) {
+                    return;
+                }
+                ERR_LOG("READ EVENTFD FAILED!");
+                abort();
+            }
+            return ;
+        }
+
+        void WeakUpEventFd() {
+            uint64_t val = 1;
+            int ret = write(_event_fd, &val, sizeof(val));
+            if (ret < 0) {
+                if (errno == EINTR) {
+                    return;
+                }
+                ERR_LOG("READ EVENTFD FAILED!");
+                abort();
+            }
+            return ;
+        }
+    public:
+        EventLoop() :_thread_id(std::this_thread::get_id()),
+                    _event_fd(CreateEventFd()),
+                    _event_channel(new Channel(this, _event_fd)),
+                    _timer_wheel(this) {
+            // 给eventfd添加可读事件回调函数，读取eventfd事件通知次数
+            _event_channel->SetReadCallback(std::bind(&EventLoop::ReadEventfd, this));
+            // 启动eventfd
+            _event_channel->EnableRead();            
+        }
+
+        void start() {
+            while (1) {
+                // 事件监控
+                std::vector<Channel *> actives;
+                _poller.Poll(&actives);
+                // 事件处理
+                for (auto &channel : actives) {
+                    channel->HandleEvent();
+                } 
+                // 执行任务
+                RunAllTask();
+            }
+        }
+        // 判断当前线程是否是EventLoop对应的线程
+        bool IsInLoop() {
+            return (_thread_id == std::this_thread::get_id());
+        }
+
+        void AssertInLoop() {
+            assert(_thread_id == std::this_thread::get_id());
+        }
+
+        void RunInLoop(const Functor &cb) {
+            if (IsInLoop()) {
+                return cb();
+            }
+            return QueueInLoop(cb);
+        }
+
+        void QueueInLoop(const Functor &cb) {
+            {
+                std::unique_lock<std::mutex> _lock(_mutex);
+                _tasks.push_back(cb);
+            }
+            //唤醒有可能因为没有事件就绪，而导致的epoll阻塞；
+            //其实就是给eventfd写入一个数据，eventfd就会触发可读事件
+            WeakUpEventFd();
+        }
+        // 添加/修改描述符的事件监控
+        void UpdateEvent(Channel *channel) { return _poller.UpdateEvent(channel); }
+        //移除描述符的监控
+        void RemoveEvent(Channel *channel) { return _poller.RemoveEvent(channel); }
+};
 
 #endif
