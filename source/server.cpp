@@ -307,7 +307,7 @@ class Channel {
         // 移除监控
         void Remove();
         void Update();
-        // 事件处理，一旦连接出发了事件， 就调用这个函数， 自己触发了什么事件如何处理自己决定
+        // 事件处理，一旦连接触发了事件， 就调用这个函数， 自己触发了什么事件如何处理自己决定
         void HandleEvent() {
             if ((_revents & EPOLLIN) || (_revents & EPOLLRDHUP) || (_revents & EPOLLPRI)) {
                 // 不管任何事件，都调用的回调函数
@@ -328,8 +328,8 @@ class Channel {
 #define MAX_EPOLLEVENTS 1024
 class Poller {
     private:
-        int _epfd;
-        struct epoll_event _evs[MAX_EPOLLEVENTS];
+        int _epfd; // epoll实例文件描述符
+        struct epoll_event _evs[MAX_EPOLLEVENTS]; // 用于存储epoll_wait()返回的就绪时间
         std::unordered_map<int, Channel*> _channels;
     private:    
         void Update(Channel *channel, int op) {
@@ -415,9 +415,117 @@ class TimerTask {
     private:
         uint64_t _id;
         uint32_t _timeout;
+        bool _canceled;
+        TaskFunc _task_cb;
+        ReleaseFunc _release;
+    public:
+        TimerTask(uint64_t id, uint32_t delay, const TaskFunc &cb):
+            _id(id), _timeout(delay), _task_cb(cb), _canceled(false) {}
+        ~TimerTask() {
+            if (_canceled == false) {
+                _task_cb();
+            }
+            ReleaseFunc _release;
+        }
+        void Cancel() { _canceled = true; }
+        void SetRelease(const ReleaseFunc &cb) {_release = cb; }
+        uint32_t DelayTime() { return _timeout; }
 };
 
-class TimerWheel {};
+class TimerWheel {
+    private:
+        using WeakTask = std::weak_ptr<TimerTask>;
+        using PtrTask = std::shared_ptr<TimerTask>;
+        int _tick;
+        int _capacity;
+        std::vector<std::vector<PtrTask>> _wheel;
+        std::unordered_map<uint64_t, WeakTask> _timers;
+
+        EventLoop *_loop;
+        int _timerfd;
+        std::unique_ptr<Channel> _timer_channel;
+    private:
+        void RemoveTimer(uint64_t id) {
+            auto it = _timers.find(id);
+            if (it != _timers.end()) {
+                _timers.erase(it);
+            }
+        }
+
+        static int CreateTimerfd() {
+            int timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
+            if (timerfd < 0) {
+                ERR_LOG("TIMERFD CREATE FAILED");
+            }
+            // int timerfd_settime(int fd, int flags, struct itimerspec *new, struct itimerspec *old);
+            struct itimerspec itime;
+            itime.it_value.tv_sec = 1;
+            itime.it_value.tv_nsec = 0; // 第一次超时时间为1s后
+            itime.it_interval.tv_sec = 1;
+            itime.it_interval.tv_nsec = 0; // 第一次超时后，每次超时的间隔时间
+            timerfd_settime(timerfd, 0, &itime, NULL);
+            return timerfd;
+        }
+
+        int ReadTimefd() {
+            uint64_t times;
+            //有可能因为其他描述符的事件处理花费事件比较长，然后在处理定时器描述符事件的时候，有可能就已经超时了很多次
+            //read读取到的数据times就是从上一次read之后超时的次数
+            int ret = read(_timerfd, &times, 8);
+            if (ret < 0) {
+                ERR_LOG("READ TIMEFD FAILED");
+                abort();
+            }
+            return times;
+        }
+
+        void RunTimerTask() {
+            _tick = (_tick + 1) % _capacity;
+            _wheel[_tick].clear();
+        }
+
+        void OnTime() {
+            // 根据实际的超时的次数，执行对应的超时任务
+            int times = ReadTimefd();
+            for (int i = 0; i < times; i++) {
+                RunTimerTask();
+            }
+        }
+
+        void TimerAddInLoop(uint64_t id, uint32_t delay, const TaskFunc &cb) {
+            PtrTask pt(new TimerTask(id, delay, cb));
+            pt->SetRelease(std::bind(&TimerWheel::RemoveTimer, this, id)); 
+            int pos = (_tick + delay) & _capacity;
+            _wheel[pos].push_back(pt);
+            _timers[id] = WeakTask(pt);
+        }
+
+        void TimerRefreshInLoop(uint64_t id) {
+            auto it = _timers.find(id);
+            if (it == _timers.end()) {
+                return;
+            }
+            Ptrtask pt = it->second.lock();
+            int delay = pt->DelayTime();
+            int pos = (_tick + delay) % _capacity;
+            _wheel[pos].push_back(pt);
+        }
+
+        void TimerCancelInLoop(uint64_t id) {
+            auto it = _timers.find(id);
+            if (it == timers.end()) {
+                return;
+            }
+            PtrTask pt = it->second.lock();
+            if (pt) pt->Cancel();
+        }
+    public:
+        TimerWheel(EventLoop *loop):_capacity(60), _tick(0), _wheel(_capacity), _loop(loop),
+            _timefd(CreateTimerfd()), _timer_channel(new Channel(_loop, _timerfd)) {
+                _timer_channel->SetReadCallback(std::bind(&TimerWheel::Ontime, this));
+                _timer_channel->EnableRead(); 启动读事件监控
+            }
+};
 
 class EventLoop {
     private:
@@ -527,7 +635,7 @@ class EventLoop {
                 _tasks.push_back(cb);
             }
             //唤醒有可能因为没有事件就绪，而导致的epoll阻塞；
-            //其实就是给eventfd写入一个数据，eventfd就会触发可读事件
+            //其实就是给eventfd写入一个数据，eventfd就会触发可读事件 
             WeakUpEventFd();
         }
         // 添加/修改描述符的事件监控
